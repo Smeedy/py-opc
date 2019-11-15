@@ -16,4 +16,9 @@ class FirmwareVersionError(Exception):
     """
     pass
 
+class OPCReadyError(Exception):
+  """Raised if the OPC unit does not respond with a 0xF3 within the opc_busy_retries
+  """
+  pass
+
 firmware_error_msg = """This is the incorrect firmware version."""

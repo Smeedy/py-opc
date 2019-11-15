@@ -8,15 +8,19 @@ import warnings
 import re
 import logging
 
-from .exceptions import firmware_error_msg
+import sys, os
+
+from .exceptions import *
 
 # set up a default logger
-logging.basicConfig(level=logging.INFO)
+LOGGING_LEVEL = os.getenv('LOGGING_LEVEL') or 'INFO'
+logging.basicConfig(level=LOGGING_LEVEL, stream=sys.stdout)
 logger = logging.getLogger(__name__)
+logger.setLevel(LOGGING_LEVEL)
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
-__all__ = ['OPCN2', 'OPCN1']
+__all__ = ['OPCN3', 'OPCN2', 'OPCN1']
 
 class _OPC(object):
     """Generic class for any Alphasense OPC. Provides the common methods and calculations for each OPC. This class is designed to be the base class, and should not be used alone unless during development.
@@ -33,16 +37,22 @@ class _OPC(object):
     :type spi_connection: spidev.SpiDev or usbiss.spi.SPI
     :type debug: boolean
     :type model: string
-    :type max_cnxn_retries: int
-    :type retry_interval_ms: int
 
     :rtype: opc._OPC
 
     """
-    def __init__(self, spi_connection, firmware=None, max_cnxn_retries=5, retry_interval_ms=1000, **kwargs):
-        self.cnxn       = spi_connection
-        self.debug      = kwargs.get('debug', False)
-        self.model      = kwargs.get('model', 'N2')
+    def __init__(self, spi_connection, firmware=None, opc_cmd_retries=20, **kwargs):
+        self.cnxn               = spi_connection
+        self.debug              = kwargs.get('debug', False)
+        self.model              = kwargs.get('model', 'N2')
+
+        self.SPI_OPC_busy       = 0x31
+        self.SPI_OPC_ready      = 0xF3
+        self.SPI_OPC_retries    = opc_cmd_retries
+
+        # overrule OS level
+        if self.debug:
+            logger.setLevel('DEBUG')
 
         if firmware is not None:
             major, minor = firmware[0], firmware[1]
@@ -59,47 +69,12 @@ class _OPC(object):
         assert self.cnxn.mode == 1, "SPI mode must be 1"
 
         # Set the firmware version upon initialization IFF it hasn't been set manually
-        i = 0
         if self.firmware['version'] is None:
-            while self.firmware['version'] is None:
-                if i > max_cnxn_retries:
-                    msg =   """
-                            Your firmware version could not be automatically detected. This is usually caused by bad wiring or a poor power supply. If niether of these are likely candidates, please open an issue on the GitHub repository at https://github.com/dhhagan/py-opc/issues/new. Another option would be to
-                            increase the max_cnxn_retries variable if you feel the serial communication is being held up for some reason.
-                            """
-
-                    raise FirmwareVersionError(msg)
-
-                # store the info_string
-                infostring = self.read_info_string()
-
-                try:
-                    self.firmware['version'] = int(re.findall("\d{3}", infostring)[-1])
-                except Exception as e:
-                    logger.error("Could not parse the fimrware version from {}".format(infostring), exc_info=True)
-
-                    # sleep for a period of time
-                    sleep(retry_interval_ms / 1000)
-
-                i += 1
-
-        # At this point, we have a firmware version
-
-        # If firmware version is >= 18, set the major and minor versions..
-        try:
-            if self.firmware['version'] >= 18.:
-                self.read_firmware()
-            else:
-                self.firmware['major'] = self.firmware['version']
-        except:
-            logger.info("No firmware version could be read.")
+            self._retrieve_version()
 
         # We requested to wait until the device is connected
         if kwargs.get('wait', False) is not False:
             self.wait(**kwargs)
-
-        else: # Sleep for a bit to alleviate issues
-            sleep(1)
 
     def _16bit_unsigned(self, LSB, MSB):
         """Returns the combined LSB and MSB
@@ -244,17 +219,13 @@ class _OPC(object):
         """
         infostring = []
 
-        # Send the command byte and sleep for 9 ms
-        self.cnxn.xfer([0x3F])
-        sleep(9e-3)
-
-        # Read the info string by sending 60 empty bytes
+        self._send_cmd(0x3F)
+         # Read the info string by sending 60 empty bytes
         for i in range(60):
             resp = self.cnxn.xfer([0x00])[0]
             infostring.append(chr(resp))
 
-        sleep(0.1)
-
+        logger.debug("infostring: {}".format(''.join(infostring)))
         return ''.join(infostring)
 
     def ping(self):
@@ -270,6 +241,267 @@ class _OPC(object):
 
     def __repr__(self):
         return "Alphasense OPC-{}v{}".format(self.model, self.firmware['version'])
+
+    def _send_cmd(self, spi_command):
+
+        tries = 1
+        data = None
+
+        while tries < self.SPI_OPC_retries:
+            data = self.cnxn.xfer([spi_command])[0]  # send command
+            logger.debug("ready_response: {}".format(hex(data)))
+
+            if data is self.SPI_OPC_ready:
+                sleep(10e-3) # wait for 10ms 
+                logger.debug("ready after {} tries".format(tries))
+                break
+            else:
+                # we are busy
+                sleep(5e-3) # wait for 5ms 
+
+            tries += 1
+
+            # we could do an SPI reset loop here and start over with some strategy
+            # we raise hard for now though
+            if tries == self.SPI_OPC_retries:
+                raise OPCReadyError("OPC not ready after {} retries".format(tries))
+
+        return True
+
+
+
+class OPCN3(_OPC):
+    """Create an instance of the Alphasene OPC-N3. Currently supported by firmware
+    versions x. opc.OPCN3 inherits from the opc.OPC parent class.
+
+    :param spi_connection: The spidev instance for the SPI connection.
+
+    :type spi_connection: spidev.SpiDev
+
+    :rtype: opc.OPCN3
+
+    :raises: opc.exceptions.FirmwareVersionError
+
+    :Example:
+
+    >>> alpha = opc.OPCN3(spi)
+    >>> alpha
+    Alphasense OPC-N3vx.y
+    """
+    def __init__(self, spi_connection, **kwargs):
+        super(OPCN3, self).__init__(spi_connection, model='N3', **kwargs)
+
+        firmware_min = 1.   # Minimum firmware version supported
+        firmware_max = 1.   # Maximum firmware version supported
+
+        if self.firmware['major'] < firmware_min or self.firmware['major'] > firmware_max:
+            logger.error("Firmware version is invalid for this device.")
+
+            raise FirmwareVersionError("Your firmware is not yet supported. Only versions 1 is currently supported.")
+
+
+    def _retrieve_version(self):
+
+        infostring = self.read_info_string()
+
+        try:
+            self.firmware['version'] = re.findall("Ver=(\d+\.[^.]+)", infostring)[0]
+        except Exception as _:
+            logger.error("Could not parse the fimrware version from {}".format(infostring), exc_info=True)
+
+        self.read_firmware()
+        logger.debug(self.firmware)
+
+    def read_firmware(self):
+        """Read the firmware version of the OPC-N3.
+
+        :rtype: dict
+
+        :Example:
+
+        >>> alpha.read_firmware()
+        {
+            'major': 18,
+            'minor': 2,
+            'version': 18.2
+        }
+        """
+        self._send_cmd(0x12)
+        self.firmware['major'] = self.cnxn.xfer([0x00])[0]
+        self.firmware['minor'] = self.cnxn.xfer([0x00])[0]
+
+        return self.firmware
+
+    def on(self):
+        """Turn ON the OPC (fan and laser)
+
+        :rtype: None
+
+        :Example:
+
+        >>> alpha.on()
+        """
+ 
+        self._send_cmd(0x03)
+        data = self.cnxn.xfer([0x07]) # turn on laser  
+
+        sleep(1) # Delay may be necessary to separate power ON of fan and laser
+
+        self._send_cmd(0x03)
+        data = self.cnxn.xfer([0x03]) # turn on fan 
+
+
+        return None
+
+    def off(self):
+        """Turn OFF the OPC (fan and laser)
+
+        :rtype: None
+
+        :Example:
+
+        >>> alpha.off()
+        """
+
+        self._send_cmd(0x03)
+        data = self.cnxn.xfer([0x06]) # turn off laser  
+
+        sleep(1e-2) # wait a bit
+
+        self._send_cmd(0x03)
+        data = self.cnxn.xfer([0x02]) # turn off fan 
+
+        return None
+
+    def histogram(self, number_concentration=True):
+        """Read and reset the histogram.
+
+        :rtype: dictionary
+
+        :Example:
+
+        >>> alpha.histogram()
+        {
+            'Bin 0': 200, 
+            'Bin 1': 32, 
+            'Bin 2': 6, 
+            ...
+            'Bin 22': 0,
+            'Bin 23': 0,
+            'Bin 1 MToF': 0,
+            ...
+            'Bin 4 MToF': 0,
+            'Sampling Period': 1.0,
+            'SFR': 5.02,
+            'Temperature': 26.5,
+            'Relative Humidity': 29.6,
+            'PM1': 3.459,
+            'PM2.5': 3.858,
+            'PM10': 3.866,
+            'Reject Count Glitch': 6,
+            'Reject Count LongTOF': 0,
+            'Reject Count Ratio': 183,
+            'Reject Count OutOfRange': 2,
+            'Fan rev count': 0,
+            'Laser status': 604,
+            'Checksum': 4533
+        }
+        """
+        resp = []
+        data = {}
+
+        # Send the command byte
+        self._send_cmd(0x30)
+
+        # read the histogram:
+        # 1-48  : 24x bins, uint16
+        # 49-52 : 4x MToF bins, uint8
+        # 53-54 : Sampling period, uint16
+        # 55-56 : Sample Flow rate, uint16
+        # 57-58 : Temperature, uint16
+        # 59-60 : Humidity, uint16
+        # 61-64 : PM_A, float
+        # 65-68 : PM_B, float
+        # 68-72 : PM_C, float
+        # 73-74 : Reject Count Glitch, uint16
+        # 75-76 : Reject Count LongTOF, uint16
+        # 77-78 : Reject Count Ratio, uint16
+        # 79-80 : Fan rev, uint16
+        # 81-82 : Laser status, uint16
+        # 83-84 : Checksum, uint16
+
+        for _ in range(86):
+            resp.append(self.cnxn.xfer([0x00])[0])
+            
+        logger.debug("hist bytes ({}): {}".format(len(resp), ''.join('{:02x}'.format(x) for x in resp)))
+
+        # 24x bins
+        for i in range(0, 48, 2):
+            data['Bin {}'.format(int(i/2))] = self._16bit_unsigned(resp[i], resp[i+1])
+
+        # 4x MToF bins
+        for i in range(48, 52, 1):
+            data['Bin {} MToF'.format(i-47)] = resp[i]
+
+        # Sample Period / Flow Rate
+        data['Sampling Period'] = self._16bit_unsigned(resp[52], resp[53]) /100 # from seconds x100
+        data['SFR'] = self._16bit_unsigned(resp[54], resp[55]) /100 # from ml/s x100
+
+        # Environmentals
+        data['Temperature']         = round(self.conv_st_to_temperature(self._16bit_unsigned(resp[56], resp[57])), 1)
+        data['Relative Humidity']   = round(self.conv_st_to_relative_humidity(self._16bit_unsigned(resp[58], resp[59])), 1)
+
+        # PM values
+        data['PM1']     = round(self._calculate_float(resp[60:64]), 3)
+        data['PM2.5']   = round(self._calculate_float(resp[64:68]), 3)
+        data['PM10']    = round(self._calculate_float(resp[68:72]), 3)
+
+        # Counts
+        data['Reject Count Glitch']     = self._16bit_unsigned(resp[72], resp[73])
+        data['Reject Count LongTOF']    = self._16bit_unsigned(resp[74], resp[75])
+        data['Reject Count Ratio']      = self._16bit_unsigned(resp[76], resp[77])
+        data['Reject Count OutOfRange'] = self._16bit_unsigned(resp[78], resp[79])
+
+        data['Fan rev count'] = self._16bit_unsigned(resp[80], resp[81]) 
+        data['Laser status']  = self._16bit_unsigned(resp[82], resp[83])
+
+        data['Checksum'] = self._16bit_unsigned(resp[84], resp[85])
+        crc16 = self.calc_crc16_modbus(resp[:84])
+        logger.debug("CRC16 calculated / provided: {:04x}/{:04x}".format(crc16, data['Checksum']))
+
+        if (crc16 == data['Checksum']):
+            return data
+        else:
+            logger.warning("CRC16 mismatch. Data transfer was incomplete")
+            return None
+
+
+    def conv_st_to_temperature(self, st):
+        """Convert SHT31 ST output to Temperature (C)
+        """
+        return -45 + 175 * st / 65535
+
+    def conv_st_to_relative_humidity(self, srh):
+        """Convert SHT31 SRH output to Relative Humidity (%)
+        """
+        return 100 * srh / 65535
+
+    def calc_crc16_modbus(self, data):
+        POLYNOMIAL_MODBUS  = 0xa001
+        INITIAL_CRC_MODBUS = 0xffff
+
+        crc = INITIAL_CRC_MODBUS
+        for pos in data:
+            crc ^= pos 
+            for _ in range(8):
+                if ((crc & 1) != 0):
+                    crc >>= 1
+                    crc ^= POLYNOMIAL_MODBUS
+                else:
+                    crc >>= 1
+        return crc
+
+
 
 class OPCN2(_OPC):
     """Create an instance of the Alphasene OPC-N2. Currently supported by firmware
@@ -310,12 +542,11 @@ class OPCN2(_OPC):
         >>> alpha.on()
         True
         """
-        b1 = self.cnxn.xfer([0x03])[0]          # send the command byte
-        sleep(9e-3)                             # sleep for 9 ms
-        b2, b3 = self.cnxn.xfer([0x00, 0x01])   # send the following byte
-        sleep(0.1)
+ 
+        self._send_cmd(0x03)
+        data = self.cnxn.xfer([0x00, 0x01])   # send the following bytes
 
-        return True if b1 == 0xF3 and b2 == 0x03 else False
+        return data[0] == 0x03
 
     def off(self):
         """Turn OFF the OPC (fan and laser)
@@ -327,12 +558,11 @@ class OPCN2(_OPC):
         >>> alpha.off()
         True
         """
-        b1 = self.cnxn.xfer([0x03])[0]          # send the command byte
-        sleep(9e-3)                             # sleep for 9 ms
-        b2 = self.cnxn.xfer([0x01])[0]          # send the following two bytes
-        sleep(0.1)
 
-        return True if b1 == 0xF3 and b2 == 0x03 else False
+        self._send_cmd(0x03)
+        data = self.cnxn.xfer([0x01])   # send the following byte
+
+        return data[0] == 0x03
 
     def config(self):
         """Read the configuration variables and returns them as a dictionary
@@ -356,9 +586,7 @@ class OPCN2(_OPC):
         config  = []
         data    = {}
 
-        # Send the command byte and sleep for 10 ms
-        self.cnxn.xfer([0x3C])
-        sleep(10e-3)
+        self._send_cmd(0x3C)
 
         # Read the config variables by sending 256 empty bytes
         for i in range(256):
@@ -393,8 +621,6 @@ class OPCN2(_OPC):
         if self.firmware['major'] > 15.:
             data['TOF_SFR'] = config[234]
 
-        sleep(0.1)
-
         return data
 
     @requires_firmware(18.)
@@ -420,12 +646,10 @@ class OPCN2(_OPC):
         config  = []
         data    = {}
 
-        # Send the command byte and sleep for 10 ms
-        self.cnxn.xfer([0x3D])
-        sleep(10e-3)
+        self._send_cmd(0x3D)
 
         # Read the config variables by sending 256 empty bytes
-        for i in range(9):
+        for _ in range(9):
             resp = self.cnxn.xfer([0x00])[0]
             config.append(resp)
 
@@ -435,8 +659,6 @@ class OPCN2(_OPC):
         data['AMLaserOnIdle']           = config[5]
         data['AMMaxDataArraysInFile']   = self._16bit_unsigned(config[6], config[7])
         data['AMOnlySavePMData']        = config[8]
-
-        sleep(0.1)
 
         return data
 
@@ -449,9 +671,7 @@ class OPCN2(_OPC):
 
         :type config_vars: dictionary
         """
-        logger.warning("This method has not yet been implemented yet.")
-
-        return
+        raise NotImplementedError("This method has not yet been implemented yet.")
 
     @requires_firmware(18.)
     def write_config_variables2(self, config_vars):
@@ -465,9 +685,8 @@ class OPCN2(_OPC):
         :type config_vars: dictionary
         """
 
-        logger.warning("This method has not yet been implemented.")
+        raise NotImplementedError("This method has not yet been implemented.")
 
-        return
 
     def histogram(self, number_concentration=True):
         """Read and reset the histogram. As of v1.3.0, histogram
@@ -506,13 +725,10 @@ class OPCN2(_OPC):
         data = {}
 
         # Send the command byte
-        self.cnxn.xfer([0x30])
-
-        # Wait 10 ms
-        sleep(10e-3)
+        self._send_cmd(0x30)
 
         # read the histogram
-        for i in range(62):
+        for _ in range(62):
             r = self.cnxn.xfer([0x00])[0]
             resp.append(r)
 
@@ -620,26 +836,16 @@ class OPCN2(_OPC):
         >>> alpha.save_config_variables()
         True
         """
-        command = 0x43
-        byte_list = [0x3F, 0x3C, 0x3F, 0x3C, 0x43]
-        success = [0xF3, 0x43, 0x3F, 0x3C, 0x3F, 0x3C]
+        success = [0x43, 0x3F, 0x3C, 0x3F, 0x3C]
         resp = []
 
-        # Send the command byte and then wait for 10 ms
-        r = self.cnxn.xfer([command])[0]
-        sleep(10e-3)
-
-        # append the response of the command byte to the List
-        resp.append(r)
+        self._send_cmd(0x43)
 
         # Send the rest of the config bytes
-        for each in byte_list:
-            r = self.cnxn.xfer([each])[0]
-            resp.append(r)
+        for each in [0x3F, 0x3C, 0x3F, 0x3C, 0x43]:
+            resp.append(self.cnxn.xfer([each])[0])
 
-        sleep(0.1)
-
-        return True if resp == success else False
+        return resp == success
 
     def _enter_bootloader_mode(self):
         """Enter bootloader mode. Must be issued prior to writing
@@ -652,8 +858,9 @@ class OPCN2(_OPC):
         >>> alpha._enter_bootloader_mode()
         True
         """
+        self._send_cmd(0x41)
 
-        return True if self.cnxn.xfer(0x41)[0] == 0xF3 else False
+        return True # send_cmd will raise the exception otherwise
 
     def set_fan_power(self, power):
         """Set only the Fan power.
@@ -673,17 +880,13 @@ class OPCN2(_OPC):
         if power > 255:
             raise ValueError("The fan power should be a single byte (0-255).")
 
-        # Send the command byte and wait 10 ms
-        a = self.cnxn.xfer([0x42])[0]
-        sleep(10e-3)
+        self._send_cmd(0x42)
 
         # Send the next two bytes
         b = self.cnxn.xfer([0x00])[0]
         c = self.cnxn.xfer([power])[0]
 
-        sleep(0.1)
-
-        return True if a == 0xF3 and b == 0x42 and c == 0x00 else False
+        return b == 0x42 and c == 0x00
 
     def set_laser_power(self, power):
         """Set the laser power only.
@@ -704,17 +907,13 @@ class OPCN2(_OPC):
         if power > 255:
             raise ValueError("Laser Power should be a single byte (0-255).")
 
-        # Send the command byte and wait 10 ms
-        a = self.cnxn.xfer([0x42])[0]
-        sleep(10e-3)
+        self._send_cmd(0x42)
 
         # Send the next two bytes
         b = self.cnxn.xfer([0x01])[0]
         c = self.cnxn.xfer([power])[0]
 
-        sleep(0.1)
-
-        return True if a == 0xF3 and b == 0x42 and c == 0x01 else False
+        return b == 0x42 and c == 0x01
 
     def toggle_laser(self, state):
         """Toggle the power state of the laser.
@@ -731,10 +930,7 @@ class OPCN2(_OPC):
         True
         """
 
-        # Send the command byte and wait 10 ms
-        a = self.cnxn.xfer([0x03])[0]
-
-        sleep(10e-3)
+        self._send_cmd(0x03)
 
         # If state is true, turn the laser ON, else OFF
         if state:
@@ -744,7 +940,7 @@ class OPCN2(_OPC):
 
         sleep(0.1)
 
-        return True if a == 0xF3 and b == 0x03 else False
+        return b == 0x03
 
     def toggle_fan(self, state):
         """Toggle the power state of the fan.
@@ -761,10 +957,7 @@ class OPCN2(_OPC):
         True
         """
 
-        # Send the command byte and wait 10 ms
-        a = self.cnxn.xfer([0x03])[0]
-
-        sleep(10e-3)
+        self._send_cmd(0x03)
 
         # If state is true, turn the fan ON, else OFF
         if state:
@@ -772,9 +965,7 @@ class OPCN2(_OPC):
         else:
             b = self.cnxn.xfer([0x05])[0]
 
-        sleep(0.1)
-
-        return True if a == 0xF3 and b == 0x03 else False
+        return b == 0x03
 
     @requires_firmware(18.)
     def read_pot_status(self):
@@ -794,17 +985,12 @@ class OPCN2(_OPC):
             'LaserON': 0
         }
         """
-        # Send the command byte and wait 10 ms
-        a = self.cnxn.xfer([0x13])[0]
-
-        sleep(10e-3)
+        self._send_cmd(0x13)
 
         # Build an array of the results
         res = []
-        for i in range(4):
+        for _ in range(4):
             res.append(self.cnxn.xfer([0x00])[0])
-
-        sleep(0.1)
 
         return {
             'FanON':        res[0],
@@ -827,12 +1013,10 @@ class OPCN2(_OPC):
         """
         string = []
 
-        # Send the command byte and sleep for 9 ms
-        self.cnxn.xfer([0x10])
-        sleep(9e-3)
+        self._send_cmd(0x10)
 
         # Read the info string by sending 60 empty bytes
-        for i in range(60):
+        for _ in range(60):
             resp = self.cnxn.xfer([0x00])[0]
             string.append(chr(resp))
 
@@ -851,7 +1035,7 @@ class OPCN2(_OPC):
         :type sn: string
         """
 
-        return
+        raise NotImplementedError("This method has not yet been implemented.")
 
     @requires_firmware(18.)
     def read_firmware(self):
@@ -868,17 +1052,12 @@ class OPCN2(_OPC):
             'version': 18.2
         }
         """
-        # Send the command byte and sleep for 9 ms
-        self.cnxn.xfer([0x12])
-        sleep(10e-3)
-
+        self._send_cmd(0x12)
         self.firmware['major'] = self.cnxn.xfer([0x00])[0]
         self.firmware['minor'] = self.cnxn.xfer([0x00])[0]
 
         # Build the firmware version
         self.firmware['version'] = float('{}.{}'.format(self.firmware['major'], self.firmware['minor']))
-
-        sleep(0.1)
 
         return self.firmware
 
@@ -903,14 +1082,10 @@ class OPCN2(_OPC):
         resp = []
         data = {}
 
-        # Send the command byte
-        self.cnxn.xfer([0x32])
-
-        # Wait 10 ms
-        sleep(10e-3)
+        self._send_cmd(0x32)
 
         # read the histogram
-        for i in range(12):
+        for _ in range(12):
             r = self.cnxn.xfer([0x00])[0]
             resp.append(r)
 
@@ -919,9 +1094,29 @@ class OPCN2(_OPC):
         data['PM2.5']   = self._calculate_float(resp[4:8])
         data['PM10']    = self._calculate_float(resp[8:])
 
-        sleep(0.1)
-
         return data
+
+    def _retrieve_version(self):
+
+        infostring = self.read_info_string()
+
+        try:
+            self.firmware['version'] = int(re.findall("\d{3}", infostring)[-1])
+        except Exception as _:
+            logger.error("Could not parse the fimrware version from {}".format(infostring), exc_info=True)
+
+        # At this point, we have a firmware version
+
+        # If firmware version is >= 18, set the major and minor versions..
+        try:
+            if self.firmware['version'] >= 18.:
+                self.read_firmware()
+            else:
+                self.firmware['major'] = self.firmware['version']
+        except:
+            logger.info("No firmware version could be read.")
+
+        logger.debug(self.firmware)
 
 class OPCN1(_OPC):
     """Create an instance of the Alphasene OPC-N1. opc.OPCN1 inherits from
