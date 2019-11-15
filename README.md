@@ -124,3 +124,29 @@ Use this approach if you have connected your RPi to the OPC-N2 via a SPI-USB ada
 
     # Turn the device off
     alpha.off()
+
+### SPI-USB Adapter with OPC-N3
+
+    from usbiss.spi import SPI
+    import opc
+    from time import sleep
+
+    # Build the connector
+    spi = SPI("/dev/ttyACM0")
+
+    # Set the SPI mode and clock speed
+    spi.mode = 1
+    spi.max_speed_hz = 500000
+
+    alpha = opc.OPCN3(spi, debug=True)
+    sleep(1) # let it settle
+
+    for i in range(10):
+        print ("Reading histogram: run {}".format(i + 1))
+        data = alpha.histogram()
+        if i > 0: # discard first as it will contain invalid data 
+            print (data)
+            sleep(2)
+
+    # and off again
+    print ("Turning off: {}".format(alpha.off()))
