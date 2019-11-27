@@ -41,7 +41,7 @@ class _OPC(object):
     :rtype: opc._OPC
 
     """
-    def __init__(self, spi_connection, firmware=None, opc_cmd_retries=20, **kwargs):
+    def __init__(self, spi_connection, firmware=None, opc_cmd_retries=20, opc_connect_retries=3, opc_connect_wait_ms=1000, **kwargs):
         self.cnxn               = spi_connection
         self.debug              = kwargs.get('debug', False)
         self.model              = kwargs.get('model', 'N2')
@@ -49,6 +49,9 @@ class _OPC(object):
         self.SPI_OPC_busy       = 0x31
         self.SPI_OPC_ready      = 0xF3
         self.SPI_OPC_retries    = opc_cmd_retries
+
+        self.connect_retries    = opc_connect_retries
+        self.connect_wait_ms    = opc_connect_wait_ms
 
         # overrule OS level
         if self.debug:
@@ -244,27 +247,37 @@ class _OPC(object):
 
     def _send_cmd(self, spi_command):
 
-        tries = 1
+        cmd_tries = 1
+        connect_tries = 1
         data = None
 
-        while tries < self.SPI_OPC_retries:
+        while cmd_tries < self.SPI_OPC_retries:
             data = self.cnxn.xfer([spi_command])[0]  # send command
             logger.debug("ready_response: {}".format(hex(data)))
 
             if data is self.SPI_OPC_ready:
                 sleep(10e-3) # wait for 10ms 
-                logger.debug("ready after {} tries".format(tries))
+                logger.debug("ready after {} cmd_tries".format(cmd_tries))
                 break
             else:
                 # we are busy
                 sleep(5e-3) # wait for 5ms 
 
-            tries += 1
+            cmd_tries += 1
 
-            # we could do an SPI reset loop here and start over with some strategy
-            # we raise hard for now though
-            if tries == self.SPI_OPC_retries:
-                raise OPCReadyError("OPC not ready after {} retries".format(tries))
+            # if we reach the cmd maximum, we will wait
+            # some considerable time and try again to get the ready byte
+            if cmd_tries > self.SPI_OPC_retries:
+
+                # additional SPI reset command here?
+                logger.debug("sleeping for {} ms before connecting again to OPC".format(self.connect_wait_ms))
+                sleep(self.connect_wait_ms / 1000)
+                cmd_tries = 1 # reset the cmd tries
+                connect_tries += 1
+
+            # we will raise if we exceed the connect retries
+            if connect_tries > self.connect_retries:
+                raise OPCReadyError("OPC not ready after {} retries".format(connect_tries))
 
         return True
 
@@ -303,6 +316,13 @@ class OPCN3(_OPC):
     def _retrieve_version(self):
 
         infostring = self.read_info_string()
+
+
+        # dirty hack on the 1.17 OPC fw version. The infostring sometimes
+        # returns 1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó
+        # after the SPI_OPC_ready byte is returned
+        if infostring[:2] == '1ó': 
+            infostring = self.read_info_string() # we'll probe it again 
 
         try:
             self.firmware['version'] = re.findall("Ver=(\d+\.[^.]+)", infostring)[0]
@@ -372,6 +392,9 @@ class OPCN3(_OPC):
         data = self.cnxn.xfer([0x02]) # turn off fan 
 
         return None
+
+    def config(self):
+        raise NotImplementedError("This method has not yet been implemented yet.")
 
     def histogram(self, number_concentration=True):
         """Read and reset the histogram.
@@ -473,7 +496,7 @@ class OPCN3(_OPC):
             return data
         else:
             logger.warning("CRC16 mismatch. Data transfer was incomplete")
-            return None
+            return False
 
 
     def conv_st_to_temperature(self, st):
