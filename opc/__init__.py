@@ -319,9 +319,9 @@ class OPCN3(_OPC):
 
 
         # dirty hack on the 1.17 OPC fw version. The infostring sometimes
-        # returns 1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó1ó
+        # returns 0x313f313f...
         # after the SPI_OPC_ready byte is returned
-        if infostring[:2] == '1ó': 
+        if infostring[0] == 0x31 and infostring[1] == 0x3f: 
             infostring = self.read_info_string() # we'll probe it again 
 
         try:
